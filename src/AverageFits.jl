@@ -4,6 +4,8 @@ using LinearAlgebra, Statistics, Hungarian, DataStructures, ImageFiltering
 
 export noisefilter, normalizeU!, fitd, matchedfitval, matchedorder, flip2makepos!
 export getdata, subtract_baseline, evaluate_fitvalue, matchedWnssda, ssdH
+export matchedfitval_clamp
+export matched_correlation, evaluate_correlation, wh_correlations
 
 """
 X = noisefilter(filter,X)
@@ -448,6 +450,10 @@ matchednssd(GTW, GTH, W, H; clamp=false, sdsr=1, tdsr=1) = (
             (ml, mnssds, rerrs) = matchcomponents(GTW, GTH, W, H; clamp=clamp, dsr=dsr, tdsr=tdsr);
             (sum(mnssds)/length(mnssds), ml, mnssds, rerrs)
             )
+matchedfitval_clamp(GTW, GTH, W, H; weighted=true, clamp=true, maskW=Colon(), maskH=Colon(), sdsr=1, tdsr=1) =
+    ((ml, fitvals, rerrs, denomsum) = fitcomponents_old(GTW, GTH, W, H; weighted=weighted, clamp=clamp, sdsr=sdsr, tdsr=tdsr);
+    (sum(fitvals)/denomsum, ml, fitvals, rerrs))
+
 function matchedimg(W, matchlist)
     Wmimg = zeros(size(W,1),length(matchlist))
     for mp in matchlist
@@ -549,8 +555,8 @@ function subtract_baseline(H::AbstractMatrix{T}; q=0.01) where T
 end
 
 function evaluate_fitvalue(gtW::AbstractArray{T}, gtH::AbstractArray{T}, X, W, H, maskW, maskH;
-        delta_f=false, weighted=true, clamp=false) where T
-    H_nobase = delta_f ? subtract_baseline(H; q=0.01) : H
+        delta_f=false, weighted=true, clamp=false, sub_base_q=0.01) where T
+    H_nobase = delta_f ? subtract_baseline(H; q=sub_base_q) : H
     if isempty(gtW) || isempty(gtH)
         avgfit, denom = fitd(X[maskW,maskH],W[maskW,:]*H_nobase[:,maskH]); ml = Tuple{Int,Int,Bool}[]
     else
@@ -558,6 +564,218 @@ function evaluate_fitvalue(gtW::AbstractArray{T}, gtH::AbstractArray{T}, X, W, H
                                 weighted=weighted, clamp=clamp)
     end
     avgfit, ml, H_nobase
+end
+
+"""
+    matched_correlation(gtH, H; maskH=Colon(), allow_sign_flip=false, ml=nothing) -> (avgcorr, ml, corrs)
+
+Ground-truth *spectra* recovery via Hungarian-matched Pearson correlation
+("program spectra correlation"). Named `gtH`/`H` (not `gtW`/`W`) to match
+the scRNA-seq field's own convention: in cNMF-style analysis (Kotliar et
+al.; `code/evaluate.jl`'s `Htrue`/`Hinferred` in the sibling `cNMF`
+project), a "program"/GEP is `H` — the `n_components x n_genes` spectra
+matrix — while `W` is per-cell *usage*, not a program. NMF has no single
+universal W/H axis convention (it depends entirely on how the caller
+orients its input `X`: features-as-rows vs. samples-as-rows), so this
+name is a deliberate choice, not a claim about any particular solver's
+internal layout — **callers are responsible for passing whichever of
+their own W/H actually holds the gene-loading/spectra matrix** as `gtH`/
+`H` here (see the call sites in LCSVD.jl/NMF.jl's `common.jl` for what
+that means concretely for those two solvers).
+
+`gtH` is `n_features x n_true` (one true component per column — this
+still follows `AverageFits`'s own features-as-rows/components-as-columns
+layout used throughout this module, e.g. [`matchWcomponents`](@ref); only
+the parameter *names* follow scRNA-seq's H=spectra convention, not the
+matrix orientation), `H` is `n_features x n_inferred` (`n_inferred >=
+n_true`). Each `gtH` column is matched to a distinct `H` column by
+maximizing correlation (cost = `1-cor`) — the same matching principle
+[`matchedfitval`](@ref)/[`fitcomponents`](@ref) use for the (X,W,H)
+reconstruction-based `fitval`, but comparing `gtH`/`H` columns directly
+(no usage matrix needed) and using Pearson correlation instead of
+normalized SSD.
+
+`maskH` restricts both `gtH` and `H` to the same feature subset before
+correlating (e.g. a shared HVG mask), matching `evaluate_fitvalue`'s
+`maskW`/`maskH` naming for the analogous per-matrix mask.
+
+`ml` supplies a precomputed matched list to *reuse* instead of running a
+fresh correlation-maximizing Hungarian: when `ml !== nothing`, no matching
+is done here and each correlation is reported on the caller's own
+gt↔inferred pairing. Pass the `ml` returned by
+[`evaluate_fitvalue`](@ref)/[`matchedfitval`](@ref) (the joint (X,W,H)
+reconstruction-fit assignment) to score, say, the usage matrix on exactly
+the same component correspondence the spectra/reconstruction fit chose,
+rather than a separately-optimized correlation matching. Each `ml` entry is
+`(gt_index, inferred_index, invert)` (2-tuples accepted too, `invert`
+defaulting to `false`); the incoming `invert` flag is always honored (a pair
+matched under inversion scores as `-r = cor(gth_i, -h_j)`), regardless of
+`allow_sign_flip` — because the supplied matching already fixed each
+component's joint sign, so it is not re-derived here (`allow_sign_flip` only
+governs the fresh-Hungarian branch when `ml === nothing`). This is what makes
+the two sides of a shared matching sign-consistent: e.g. deciding a
+component's sign by its spectra and reporting the usage correlation under that
+same sign. Entries whose indices fall outside `R` are skipped.
+
+`allow_sign_flip=true` matches (and should only be used for) factorizations
+with no non-negativity constraint on `H`'s companion `W`, where a
+component's `(w_i, h_i)` pair carries a free joint sign ambiguity —
+flipping the sign of both leaves the reconstruction `w_i*h_i'` (and any
+sign-symmetric L1 sparsity penalty) unchanged, so `h_i` and `-h_i` are
+equally valid recoveries of true component `i` (e.g. PCB at its
+nonnegativity-penalty weight `β=0`; see `cNMF`'s sibling
+`code/evaluate.jl`'s `match_programs`/`matched_correlations`, which this
+mirrors). With this on, the Hungarian assignment costs on `1-abs(R)`
+instead of `1-R` (so a component matched only after sign-flipping isn't
+penalized in the assignment itself), and each reported correlation is
+`abs(R[i,j])` — the better of `h_j` and `-h_j` against true component `i`.
+
+Returns `avgcorr` (mean matched correlation), `ml` (`Vector{Tuple{Int,
+Int,Bool}}`, `(gt_index, inferred_index, invert)` per match — `invert` is
+always `false` unless `allow_sign_flip=true` and the match was better
+against `-h_j`, kept as a 3-tuple to match `matchWcomponents`/
+`matchedimg`/`ssdH`'s shape), and `corrs` (the per-component correlations,
+`corrs[i]` matching `ml[i]`).
+"""
+function matched_correlation(gtH::AbstractMatrix, H::AbstractMatrix; maskH=Colon(), allow_sign_flip::Bool=false, ml=nothing)
+    gth = gtH[maskH, :]; h = H[maskH, :]
+    R = cor(gth, h)   # n_true x n_inferred: R[i,j] = cor(gth[:,i], h[:,j])
+    # A collapsed component (zero-variance / all-zero column, common mid-iteration for
+    # noisy or over-complete factorizations) makes cor return NaN; `Hungarian.hungarian`
+    # HANGS on a NaN cost matrix. Treat a degenerate pair as zero correlation so the
+    # assignment is well-defined and the reported R isn't NaN-poisoned.
+    replace!(R, NaN => zero(eltype(R)))
+    mlout = Tuple{Int,Int,Bool}[]
+    corrs = eltype(R)[]
+    if ml === nothing
+        # default: pick the matching by a fresh correlation-maximizing Hungarian.
+        cost = allow_sign_flip ? 1 .- abs.(R) : 1 .- R
+        assignment, _ = hungarian(cost)
+        for i in axes(R, 1)
+            j = assignment[i]
+            j == 0 && continue   # unmatched (only possible when size(H,2) < size(gtH,2))
+            r = R[i, j]
+            invert = allow_sign_flip && r < 0
+            push!(mlout, (i, j, invert))
+            push!(corrs, allow_sign_flip ? abs(r) : r)
+        end
+    else
+        # reuse a caller-supplied matched list — e.g. `evaluate_fitvalue`/
+        # `matchedfitval`'s `ml`, the joint (X,W,H) reconstruction-fit assignment —
+        # instead of running a separate correlation Hungarian, so the correlation is
+        # reported on exactly the same gt↔inferred pairing the fit chose. Each `ml`
+        # entry is `(gt_index, inferred_index, invert)` (2-tuples also accepted,
+        # invert defaulting to false), matching `fitcomponents`/`matchWcomponents`.
+        for t in ml
+            i, j = t[1], t[2]
+            (j == 0 || j > size(R, 2) || i > size(R, 1)) && continue
+            invert = length(t) >= 3 ? t[3] : false
+            r = R[i, j]
+            # honor the incoming pairing's sign flag: the supplied `ml` already fixed
+            # the joint sign of each matched (w_j,h_j) pair, so a component matched
+            # under inversion aligns as -r (cor(gth_i, -h_j)). `allow_sign_flip` only
+            # governs the fresh-Hungarian branch above; here the sign is not re-derived
+            # (independently abs-ing each side would let W and H pick inconsistent
+            # signs, impossible for one jointly-signed component).
+            push!(mlout, (i, j, invert))
+            push!(corrs, invert ? -r : r)
+        end
+    end
+    sum(corrs) / length(corrs), mlout, corrs
+end
+
+"""
+    evaluate_correlation(gtH, H, maskH; allow_sign_flip=false, ml=nothing) -> (avgcorr, ml, corrs)
+
+[`matched_correlation`](@ref) with `evaluate_fitvalue`'s no-ground-truth
+fallback: returns `(NaN, Tuple{Int,Int,Bool}[], eltype(H)[])` when `gtH`
+is empty, so it can be called unconditionally right alongside
+`evaluate_fitvalue` at every trace-recording site regardless of whether
+ground truth was supplied. `gtH`/`H` name the spectra/program matrix per
+the scRNA-seq convention — see [`matched_correlation`](@ref)'s docstring
+for why that isn't necessarily whatever a given solver happens to call
+`H` internally; it's on the caller to pass the right matrix. See
+[`matched_correlation`](@ref) for `allow_sign_flip`.
+"""
+function evaluate_correlation(gtH::AbstractArray{T}, H::AbstractArray, maskH; allow_sign_flip::Bool=false, ml=nothing) where T
+    isempty(gtH) && return T(NaN), Tuple{Int,Int,Bool}[], T[]
+    matched_correlation(gtH, H; maskH=maskH, allow_sign_flip=allow_sign_flip, ml=ml)
+end
+
+"""
+    wh_correlations(gtW, gtHt, W, Ht; maskW=Colon(), maskH=Colon(), primary=:W,
+                    allow_sign_flip=false, weighted=true) -> (wcorr, hcorr)
+
+Matched ground-truth correlation for BOTH factors of an `X ≈ W*Ht'` decomposition,
+on a SINGLE shared matching. This is the reusable form of the pattern every
+factorization method needs (LCSVD, NMF, CompNMF, …): match components once, then
+score both factors on that one correspondence.
+
+`primary` picks what defines the matching; both R values are then reported on that
+one pairing (the secondary factor reuses it, and its joint sign decisions, via
+[`matched_correlation`](@ref)'s `ml`), so they describe the same ground-truth↔
+component correspondence.
+
+- `:W` — the left factor's own correlation-maximizing Hungarian.
+- `:H` — the right factor's.
+- `:WH` — **both factors jointly**: the Hungarian of [`fitcomponents`](@ref) on the
+  rank-1 reconstruction agreement `‖gtWᵢ⊗gtHᵢ − Wⱼ⊗Hⱼ‖²` — the same matching
+  [`matchedfitval`](@ref)/`avgfits` already uses. Prefer this when components can be
+  near-degenerate in ONE factor: in an over-complete fit (ncomp ≫ ntrue) a surplus
+  component can end up a near-copy of a real one in `W` while its `Ht` is quite
+  different, which makes the `:W` cost matrix nearly tied. Numerical jitter then flips
+  the assignment; `wcorr` barely moves (the pair was tied) but `hcorr` drops sharply,
+  as a transient downward spike on an otherwise flat converged trace. Matching on the
+  outer product prices the `Ht` disagreement into the cost, so the tie is broken.
+  Trade-off: the matching becomes scale-sensitive (`fitd` scores amplitude, unlike
+  Pearson R), and `wcorr` is no longer "the best achievable R" but "the R at the
+  pairing the reconstruction chose", so it can read slightly lower.
+
+`weighted` applies only to `:WH` (it is [`fitcomponents`](@ref)'s power weighting of
+the assignment cost); pass the same value the companion `avgfits`/`wavgfits` call uses
+to keep fit and correlation on one pairing. `allow_sign_flip` governs the `:W`/`:H`
+Hungarian only — `fitcomponents` does not consider sign flips, so under `:WH` every
+match carries `invert=false`.
+
+- `W`   : `features_W × ncomp`  left factor  (columns = components) ; `gtW`  : `features_W × ntrue`
+- `Ht`  : `features_H × ncomp`  right factor (`Ht == H'`, columns = components) ; `gtHt` : `features_H × ntrue`
+  (`gtHt == permutedims(gtH)` when the right factor's ground truth is stored as `H`)
+
+`maskW`/`maskH` restrict each factor to a feature subset before correlating (see
+[`matched_correlation`](@ref)). `allow_sign_flip` is applied to the primary matching
+(e.g. for a factorization with no non-negativity constraint, where each `(w_i,h_i)`
+pair has a free joint sign); the secondary factor always honors the primary's sign,
+keeping the two sides consistent. This module carries no application-specific meaning
+for the two factors — which one is `W` vs `Ht` is entirely the caller's orientation.
+Returns `(wcorr, hcorr)`.
+"""
+function wh_correlations(gtW, gtHt, W, Ht; maskW=Colon(), maskH=Colon(),
+        primary::Symbol=:W, allow_sign_flip::Bool=false, weighted::Bool=true)
+    primary in (:W, :H, :WH) ||
+        throw(ArgumentError("primary must be :W, :H or :WH, got $primary"))
+    if primary == :WH
+        # No ground truth: fall through to the per-factor path, which returns NaN
+        # rather than handing `fitcomponents` an empty matrix.
+        if isempty(gtW) || isempty(gtHt)
+            wcorr, _, _ = evaluate_correlation(gtW,  W,  maskW; allow_sign_flip=allow_sign_flip)
+            hcorr, _, _ = evaluate_correlation(gtHt, Ht, maskH; allow_sign_flip=allow_sign_flip)
+            return wcorr, hcorr
+        end
+        # fitcomponents takes the RIGHT factor with components as ROWS
+        # (ntrue/ncomp x features_H), so transpose gtHt/Ht; masks are applied by
+        # slicing here because `matchedfitval` swallows its own maskW/maskH.
+        ml, _, _, _ = fitcomponents(gtW[maskW, :], permutedims(gtHt[maskH, :]),
+                                    W[maskW, :],   permutedims(Ht[maskH, :]); weighted=weighted)
+        wcorr, _, _ = evaluate_correlation(gtW,  W,  maskW; allow_sign_flip=allow_sign_flip, ml=ml)
+        hcorr, _, _ = evaluate_correlation(gtHt, Ht, maskH; allow_sign_flip=allow_sign_flip, ml=ml)
+    elseif primary == :H
+        hcorr, ml, _ = evaluate_correlation(gtHt, Ht, maskH; allow_sign_flip=allow_sign_flip)
+        wcorr, _, _  = evaluate_correlation(gtW,  W,  maskW; allow_sign_flip=allow_sign_flip, ml=ml)
+    else
+        wcorr, ml, _ = evaluate_correlation(gtW,  W,  maskW; allow_sign_flip=allow_sign_flip)
+        hcorr, _, _  = evaluate_correlation(gtHt, Ht, maskH; allow_sign_flip=allow_sign_flip, ml=ml)
+    end
+    wcorr, hcorr
 end
 
 end # module AverageFits
